@@ -921,6 +921,10 @@ async function loadAllTasks() {
   // Fetch vault files (one per owner, contains all sections)
   for (const owner of TASK_OWNERS) {
     const path = VAULT_TASK_FILES[owner];
+    if (!path) {
+      console.warn(`No vault path configured for owner "${owner}", skipping`);
+      continue;
+    }
     fetches.push(
       fetch(cacheBust(path))
         .then(r => r.ok ? r.text() : '')
