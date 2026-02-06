@@ -1,0 +1,11 @@
+{
+  "openclawToken": "",
+  "weatherLocation": "YourCity,State",
+  "dataPrefix": "/data",
+  "vaultPaths": {
+    "work": "/data/obnotes/work/work-tasks.md",
+    "personal": "/data/obnotes/personal/personal-tasks.md",
+    "agent": "/data/obnotes/agent/agent-tasks.md"
+  },
+  "inboxPath": "/data/obnotes/inbox.md"
+}

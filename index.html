@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en" data-dashboard-version="2026-02-06.0245">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Task Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css" />
+    <link rel="stylesheet" href="style.css?v=2026-02-06.0245" />
+  </head>
+  <body class="show-done-badge">
+    <div class="ambient"></div>
+    <main class="page">
+      <header class="topbar">
+        <div class="topbar-row">
+          <div class="topbar-title">
+            <p class="eyebrow" id="eyebrow">Focus now</p>
+            <h1><a href="#home" class="logo-link">Argos</a></h1>
+          </div>
+          <div class="topbar-actions">
+            <nav class="tabs" role="tablist">
+              <button class="tab-button" type="button" data-tab="home" role="tab">
+                Home
+              </button>
+              <button class="tab-button" type="button" data-tab="tasks" role="tab">
+                Tasks
+              </button>
+              <button class="tab-button" type="button" data-tab="completed" role="tab">
+                History
+              </button>
+              <button class="tab-button" type="button" data-tab="files" role="tab">
+                Files
+              </button>
+              <button class="tab-button" type="button" data-tab="openclaw" role="tab">
+                OpenClaw
+              </button>
+            </nav>
+            <button id="refresh" class="button">Refresh</button>
+          </div>
+        </div>
+        <div class="topbar-row topbar-row-secondary">
+          <p class="subtle" id="status">Loading tasks...</p>
+          <div class="topbar-meta">
+            <div class="tasks-controls" id="tasks-controls">
+              <label class="filter-label" for="project-filter">Project</label>
+              <select id="project-filter" class="filter-select">
+                <option value="All">All</option>
+              </select>
+            </div>
+            <span class="version-stamp subtle" id="version-stamp"></span>
+          </div>
+        </div>
+      </header>
+
+      <div class="tab-panel" id="tab-home" role="tabpanel">
+        <section class="section active" id="home-active-section">
+          <div class="section-header">
+            <h2>🔥 Active Now</h2>
+            <span class="count" id="home-active-count">0</span>
+          </div>
+          <ul class="list" id="home-active-list">
+            <li class="subtle">Loading...</li>
+          </ul>
+        </section>
+
+        <div class="home-grid">
+          <section class="section" id="calendar-section">
+            <div class="section-header">
+              <h2>📅 Today</h2>
+            </div>
+            <div id="calendar-content">
+              <p class="subtle">Loading calendar...</p>
+            </div>
+          </section>
+
+          <section class="section" id="projects-section">
+            <div class="section-header">
+              <h2>📊 Projects</h2>
+            </div>
+            <div id="projects-content">
+              <p class="subtle">Loading projects...</p>
+            </div>
+          </section>
+        </div>
+
+        <section class="section" id="quick-stats">
+          <div class="section-header">
+            <h2>⚡ Quick Stats</h2>
+          </div>
+          <div class="stats-grid" id="stats-content">
+            <div class="stat">
+              <span class="stat-value" id="stat-active">-</span>
+              <span class="stat-label">Active</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="stat-backlog">-</span>
+              <span class="stat-label">Backlog</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="stat-inbox">-</span>
+              <span class="stat-label">Inbox</span>
+            </div>
+          </div>
+        </section>
+
+        <div class="home-grid">
+          <section class="section" id="brief-section">
+            <div class="section-header">
+              <h2>📰 Today's Brief</h2>
+            </div>
+            <div id="brief-content">
+              <p class="subtle">Loading brief...</p>
+            </div>
+          </section>
+
+          <section class="section" id="context-section">
+            <div class="section-header">
+              <h2>📍 Context</h2>
+            </div>
+            <div id="context-content">
+              <p class="subtle">Loading context...</p>
+            </div>
+          </section>
+
+          <section class="section" id="weather-section">
+            <div class="section-header">
+              <h2>🌤️ Weather</h2>
+            </div>
+            <div id="weather-content">
+              <p class="subtle">Loading weather...</p>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div class="tab-panel" id="tab-tasks" role="tabpanel" hidden>
+        <section class="section active" id="active-section">
+          <div class="section-header">
+            <h2>Active</h2>
+            <span class="count" id="active-count">0</span>
+          </div>
+          <ul class="list" id="active-list"></ul>
+        </section>
+
+        <section class="section" id="inbox-section">
+          <div class="section-header">
+            <h2>Inbox</h2>
+            <span class="count" id="inbox-count">0</span>
+          </div>
+          <ul class="list" id="inbox-list"></ul>
+        </section>
+
+        <section class="section" id="backlog-section">
+          <div class="section-header">
+            <h2>Backlog</h2>
+            <span class="count" id="backlog-count">0</span>
+          </div>
+          <ul class="list" id="backlog-list"></ul>
+        </section>
+
+        <section class="section">
+          <details id="someday-section" open="false">
+            <summary>
+              <div class="section-header">
+                <h2>Someday</h2>
+                <span class="count" id="someday-count">0</span>
+              </div>
+            </summary>
+            <ul class="list" id="someday-list"></ul>
+          </details>
+        </section>
+
+        <section class="section hint" id="hint">
+          <p>
+            If tasks do not load, open this folder with a local server (for example,
+            <code>python3 -m http.server</code>) so the browser can read
+            <code>../../tasks/*.md</code>.
+          </p>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-completed" role="tabpanel" hidden>
+        <section class="section">
+          <div class="section-header">
+            <h2>History</h2>
+            <span class="count" id="completed-total">0</span>
+          </div>
+          <div id="completed-content">
+            <p class="subtle">Loading history...</p>
+          </div>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-files" role="tabpanel" hidden>
+        <section class="section">
+          <div class="section-header">
+            <h2>Workspace Files</h2>
+            <div class="files-header-actions">
+              <button class="button button-small" type="button" id="open-data" title="Open in new tab">Open /data/</button>
+              <span class="count" id="files-count">0</span>
+            </div>
+          </div>
+          <div class="breadcrumbs" id="files-breadcrumbs"></div>
+          <p class="subtle" id="files-status">Loading /data/...</p>
+          <a class="parent-dir" id="folder-up" href="#" title="Parent directory">↑ ..</a>
+          <ul class="list files-list" id="files-list"></ul>
+        </section>
+
+        <section class="section markdown-viewer" id="markdown-viewer" hidden>
+          <div class="section-header">
+            <div>
+              <h2>Markdown Viewer</h2>
+              <p class="subtle" id="markdown-path">No file selected.</p>
+            </div>
+            <div class="viewer-actions">
+              <div class="viewer-toggle-group" role="group" aria-label="Markdown view mode">
+                <button class="button button-small button-ghost viewer-toggle" type="button" data-mode="preview" aria-label="Preview" title="Preview">Aa</button>
+                <button class="button button-small button-ghost viewer-toggle" type="button" data-mode="raw" aria-label="Raw" title="Raw">{}</button>
+              </div>
+              <a class="button button-small button-ghost button-raw-link" id="markdown-raw-link" href="#" target="_blank" rel="noopener">Open Raw</a>
+            </div>
+          </div>
+          <div class="markdown-content">
+            <div id="markdown-preview"></div>
+            <pre id="markdown-raw" class="markdown-raw" hidden><code class="language-markdown"></code></pre>
+          </div>
+        </section>
+      </div>
+
+      <div class="tab-panel" id="tab-openclaw" role="tabpanel" hidden>
+        <section class="section">
+          <div class="section-header">
+            <h2>OpenClaw</h2>
+          </div>
+          <p class="subtle">
+            Launch the OpenClaw web UI in a new tab.
+          </p>
+          <button class="button" id="openclaw-button" type="button">
+            Open OpenClaw
+          </button>
+        </section>
+      </div>
+    </main>
+
+    <footer class="status-footer" aria-label="System status">
+      <div class="status-footer-inner">
+        <div class="status-footer-header">
+          <span class="status-footer-title">System Status</span>
+          <span class="status-footer-updated subtle" id="status-updated">Updated --</span>
+        </div>
+        <div class="status-rows" id="status-rows">
+          <div class="status-row">
+            <span class="status-label">Codex</span>
+            <span class="status-value subtle">Loading...</span>
+          </div>
+        </div>
+      </div>
+    </footer>
+
+    <div class="modal" id="task-modal" hidden>
+      <div class="modal-backdrop" data-modal-close="true"></div>
+      <div
+        class="modal-content"
+        id="task-modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="task-modal-title"
+        tabindex="-1"
+      >
+        <button class="modal-close" id="task-modal-close" type="button" data-modal-close="true" aria-label="Close">X</button>
+        <h2 id="task-modal-title">Task</h2>
+        <div class="modal-meta" id="task-modal-meta"></div>
+        <div class="modal-notes" id="task-modal-notes"></div>
+      </div>
+    </div>
+
+    <div class="modal" id="file-modal" hidden>
+      <div class="modal-backdrop" data-file-modal-close="true"></div>
+      <div
+        class="modal-content modal-content-wide"
+        id="file-modal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="file-modal-title"
+        tabindex="-1"
+      >
+        <div class="file-modal-header">
+          <h2 id="file-modal-title">File</h2>
+          <div class="file-modal-actions">
+            <div class="viewer-toggle-group" role="group" aria-label="View mode">
+              <button class="button button-small button-ghost file-modal-toggle" type="button" data-mode="preview" aria-label="Preview" title="Preview">Aa</button>
+              <button class="button button-small button-ghost file-modal-toggle" type="button" data-mode="raw" aria-label="Raw" title="Raw">{}</button>
+            </div>
+            <a class="button button-small button-ghost" id="file-modal-raw-link" href="#" target="_blank" rel="noopener">Open Raw</a>
+            <button class="button button-small button-ghost" id="file-modal-close" type="button" data-file-modal-close="true" aria-label="Close">✕</button>
+          </div>
+        </div>
+        <div class="file-modal-content">
+          <div id="file-modal-preview"></div>
+          <pre id="file-modal-raw" class="markdown-raw" hidden><code></code></pre>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/markdown.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/javascript.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/typescript.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/json.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/yaml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/xml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/css.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/python.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/bash.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/toml.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/rust.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/go.min.js"></script>
+    <script src="app.js?v=2026-02-06.0245"></script>
+  </body>
+</html>

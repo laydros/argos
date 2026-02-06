@@ -1,0 +1,7 @@
+config.json
+argos.json
+dashboard.json
+*.env
+.env*
+node_modules/
+.DS_Store

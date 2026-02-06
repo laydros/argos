@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+"""task — CLI for Argos vault-format task CRUD operations.
+
+Reads and writes Obsidian vault task files using Dataview checkbox format.
+See: obnotes/reference/task-format-spec.md for the canonical format.
+
+Usage examples:
+    task list                          # All tasks, all owners
+    task list --owner work             # Work tasks only
+    task list --owner agent --section active
+    task add --owner work --section active "Fix DNS on charon-01" --project dr --priority high
+    task add --owner personal --section backlog "Call dentist" --due 2026-03-01 --tags health,appointment
+    task done "Fix DNS"                # Fuzzy match, marks done, moves to Done section
+    task move "Call dentist" --to active
+    task health                        # Check format issues across all files
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+
+def detect_obsidian_vault(default_name: str = "obnotes") -> Path | None:
+    if platform.system() != "Darwin":
+        return None
+
+    config_path = Path.home() / "Library/Application Support/obsidian/obsidian.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        data = json.loads(config_path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+    vaults = data.get("vaults", {})
+    if not isinstance(vaults, dict):
+        return None
+
+    candidates: list[Path] = []
+    for vault in vaults.values():
+        if not isinstance(vault, dict):
+            continue
+        path = vault.get("path")
+        if not path:
+            continue
+        vault_path = Path(path)
+        if vault_path.name == default_name:
+            return vault_path
+        candidates.append(vault_path)
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
+def resolve_vault_dir(cli_value: str | None = None) -> Path:
+    if cli_value:
+        return Path(cli_value).expanduser()
+
+    env_value = os.environ.get("ARGOS_VAULT_DIR")
+    if env_value:
+        return Path(env_value).expanduser()
+
+    if platform.system() == "Darwin":
+        detected = detect_obsidian_vault()
+        if detected:
+            return detected
+        return Path.home() / "Documents/obnotes"
+
+    return Path.home() / ".openclaw/workspace/obnotes"
+
+
+def configure_vault_paths(vault_dir: Path) -> None:
+    global VAULT_DIR, TASK_FILES, INBOX_FILE
+    VAULT_DIR = vault_dir
+    TASK_FILES = {
+        "work": VAULT_DIR / "work/work-tasks.md",
+        "personal": VAULT_DIR / "personal/personal-tasks.md",
+        "agent": VAULT_DIR / "zag/zag-tasks.md",
+    }
+    INBOX_FILE = VAULT_DIR / "inbox.md"
+
+
+configure_vault_paths(resolve_vault_dir())
+
+VALID_SECTIONS = {"Active", "Backlog", "Someday", "Done"}
+CHECKBOX_RE = re.compile(
+    r"^- \[([ /x\-])\] (.+)$"
+)
+INLINE_FIELD_RE = re.compile(r"\[(\w+)::\s*([^\]]+)\]")
+TAG_RE = re.compile(r"(?<!\[)#([\w-]+)")
+TODAY = date.today().isoformat()
+
+STATE_MAP = {" ": "todo", "/": "in_progress", "x": "done", "-": "cancelled"}
+STATE_CHAR = {"todo": " ", "in_progress": "/", "done": "x", "cancelled": "-"}
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class VaultTask:
+    """A single task parsed from a vault markdown file."""
+    title: str
+    state: str  # 'todo', 'in_progress', 'done', 'cancelled'
+    tags: list[str] = field(default_factory=list)
+    due: str | None = None
+    project: str | None = None
+    priority: str | None = None
+    done_date: str | None = None
+    created: str | None = None
+    description: list[str] = field(default_factory=list)
+    section: str = "Active"
+    owner: str = ""
+    line_number: int = 0  # 0-indexed line in the file
+    raw_line: str = ""  # Original checkbox line for precise editing
+
+    @property
+    def display_title(self) -> str:
+        """Title stripped of inline fields and tags for display."""
+        t = self.raw_title_part
+        return t.strip() if t else self.title
+
+    @property
+    def raw_title_part(self) -> str:
+        """Title with fields/tags stripped."""
+        text = self.title
+        text = INLINE_FIELD_RE.sub("", text)
+        text = TAG_RE.sub("", text)
+        return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def split_frontmatter(lines: list[str]) -> tuple[list[str], list[str]]:
+    """Split file lines into (frontmatter_lines, body_lines).
+
+    Frontmatter includes the opening and closing '---' delimiters.
+    """
+    if not lines or lines[0].rstrip() != "---":
+        return [], lines
+
+    for i in range(1, len(lines)):
+        if lines[i].rstrip() == "---":
+            return lines[: i + 1], lines[i + 1:]
+
+    # Unclosed frontmatter — treat as no frontmatter
+    return [], lines
+
+
+def parse_tasks(filepath: Path, owner: str) -> list[VaultTask]:
+    """Parse all tasks from a vault task file."""
+    if not filepath.exists():
+        return []
+
+    lines = filepath.read_text().splitlines()
+    _, body = split_frontmatter(lines)
+
+    tasks: list[VaultTask] = []
+    current_section = "Active"  # Default if no section header found yet
+    fm_len = len(lines) - len(body)
+
+    i = 0
+    while i < len(body):
+        line = body[i]
+
+        # Track section headers
+        if line.startswith("## "):
+            header = line[3:].strip()
+            if header in VALID_SECTIONS:
+                current_section = header
+
+        # Parse checkbox lines
+        m = CHECKBOX_RE.match(line)
+        if m:
+            state_char, content = m.group(1), m.group(2)
+            state = STATE_MAP.get(state_char, "todo")
+
+            # Extract inline fields
+            fields: dict[str, str] = {}
+            for fm in INLINE_FIELD_RE.finditer(content):
+                fields[fm.group(1).lower()] = fm.group(2).strip()
+
+            # Extract tags
+            tags = TAG_RE.findall(content)
+
+            # Title is the content with fields/tags stripped
+            title_clean = INLINE_FIELD_RE.sub("", content)
+            title_clean = TAG_RE.sub("", title_clean).strip()
+
+            # Collect indented description lines
+            desc: list[str] = []
+            j = i + 1
+            while j < len(body):
+                dline = body[j]
+                if dline.startswith("  ") and not CHECKBOX_RE.match(dline):
+                    desc.append(dline)
+                else:
+                    break
+                j += 1
+
+            task = VaultTask(
+                title=title_clean,
+                state=state,
+                tags=tags,
+                due=fields.get("due"),
+                project=fields.get("project"),
+                priority=fields.get("priority"),
+                done_date=fields.get("done"),
+                created=fields.get("created"),
+                description=desc,
+                section=current_section,
+                owner=owner,
+                line_number=fm_len + i,
+                raw_line=line,
+            )
+            tasks.append(task)
+            i = j
+            continue
+
+        i += 1
+
+    return tasks
+
+
+def load_all_tasks(owner_filter: str | None = None) -> list[VaultTask]:
+    """Load tasks from all vault files, optionally filtered by owner."""
+    all_tasks: list[VaultTask] = []
+    files = TASK_FILES
+    if owner_filter:
+        key = owner_filter.lower()
+        if key in TASK_FILES:
+            files = {key: TASK_FILES[key]}
+        else:
+            print(f"Error: Unknown owner '{owner_filter}'. Valid: {', '.join(TASK_FILES.keys())}")
+            sys.exit(1)
+
+    for owner, path in files.items():
+        all_tasks.extend(parse_tasks(path, owner))
+
+    # Also parse inbox
+    if not owner_filter or owner_filter == "inbox":
+        if INBOX_FILE.exists():
+            all_tasks.extend(parse_tasks(INBOX_FILE, "inbox"))
+
+    return all_tasks
+
+
+# ---------------------------------------------------------------------------
+# File rewriting helpers
+# ---------------------------------------------------------------------------
+
+def read_file(filepath: Path) -> list[str]:
+    """Read file as list of lines (no trailing newlines)."""
+    return filepath.read_text().splitlines()
+
+
+def write_file(filepath: Path, lines: list[str]) -> None:
+    """Write lines back to file, updating the `updated:` frontmatter field."""
+    text = "\n".join(lines) + "\n"
+
+    # Update `updated:` in frontmatter
+    text = re.sub(
+        r"^(updated:\s*)\S+",
+        rf"\g<1>{TODAY}",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    filepath.write_text(text)
+
+
+def build_task_line(
+    title: str,
+    state: str = "todo",
+    tags: list[str] | None = None,
+    priority: str | None = None,
+    due: str | None = None,
+    project: str | None = None,
+    created: str | None = None,
+    done_date: str | None = None,
+) -> str:
+    """Build a formatted checkbox line from components.
+
+    Field order: title, tags, priority, due, project, created, done.
+    """
+    char = STATE_CHAR.get(state, " ")
+    parts = [f"- [{char}] {title}"]
+
+    if tags:
+        for tag in tags:
+            t = tag.lstrip("#")
+            parts.append(f"#{t}")
+
+    if priority:
+        parts.append(f"[priority:: {priority}]")
+    if due:
+        parts.append(f"[due:: {due}]")
+    if project:
+        parts.append(f"[project:: {project}]")
+    if created:
+        parts.append(f"[created:: {created}]")
+    if done_date:
+        parts.append(f"[done:: {done_date}]")
+
+    return " ".join(parts)
+
+
+def find_section_range(lines: list[str], section: str) -> tuple[int, int]:
+    """Find the line range for a section in file lines.
+
+    Returns (header_line, next_section_or_eof). The header_line is the
+    index of the '## Section' header. Content runs from header_line+1
+    to end (exclusive).
+    """
+    header_idx = -1
+    end_idx = len(lines)
+
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            hdr = line[3:].strip()
+            if hdr == section and header_idx == -1:
+                header_idx = i
+            elif header_idx != -1 and hdr in VALID_SECTIONS:
+                end_idx = i
+                break
+
+    if header_idx == -1:
+        return -1, -1
+
+    return header_idx, end_idx
+
+
+def find_insert_point(lines: list[str], section: str) -> int:
+    """Find where to insert a new task in a section.
+
+    Inserts at the end of existing tasks in the section (before the next
+    section header or EOF), skipping trailing blank lines.
+    """
+    header_idx, end_idx = find_section_range(lines, section)
+
+    if header_idx == -1:
+        # Section doesn't exist — we'll need to create it
+        return -1
+
+    # Walk backward from end to skip blank lines
+    insert = end_idx
+    while insert > header_idx + 1 and lines[insert - 1].strip() == "":
+        insert -= 1
+
+    return insert
+
+
+def ensure_section_exists(lines: list[str], section: str) -> list[str]:
+    """Ensure a section header exists. If not, add it before Done or at EOF."""
+    for line in lines:
+        if line.strip() == f"## {section}":
+            return lines
+
+    # Find where to insert the section header
+    # Order: Active, Backlog, Someday, Done
+    section_order = ["Active", "Backlog", "Someday", "Done"]
+    try:
+        target_pos = section_order.index(section)
+    except ValueError:
+        target_pos = len(section_order)
+
+    # Find the first section that should come after our target
+    insert_before = len(lines)
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            hdr = line[3:].strip()
+            if hdr in section_order:
+                hdr_pos = section_order.index(hdr)
+                if hdr_pos > target_pos:
+                    insert_before = i
+                    break
+
+    new_lines = lines[:insert_before]
+    if new_lines and new_lines[-1].strip() != "":
+        new_lines.append("")
+    new_lines.append(f"## {section}")
+    new_lines.append("")
+    new_lines.extend(lines[insert_before:])
+
+    return new_lines
+
+
+def fuzzy_match_task(tasks: list[VaultTask], query: str) -> VaultTask | None:
+    """Find a task by fuzzy title match. Case-insensitive substring."""
+    query_lower = query.lower()
+
+    # Exact match first
+    for t in tasks:
+        if t.title.lower() == query_lower:
+            return t
+
+    # Substring match
+    matches = [t for t in tasks if query_lower in t.title.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) > 1:
+        print(f"Ambiguous match for '{query}'. Found {len(matches)} tasks:")
+        for m in matches:
+            print(f"  [{m.owner}] [{m.section}] {m.title}")
+        sys.exit(1)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args: argparse.Namespace) -> None:
+    """List tasks, optionally filtered by owner and section."""
+    tasks = load_all_tasks(args.owner)
+
+    if args.section:
+        section = args.section.capitalize()
+        tasks = [t for t in tasks if t.section == section]
+
+    if not tasks:
+        print("No tasks found.")
+        return
+
+    # Group by owner then section
+    grouped: dict[str, dict[str, list[VaultTask]]] = {}
+    for t in tasks:
+        grouped.setdefault(t.owner, {}).setdefault(t.section, []).append(t)
+
+    section_order = ["Active", "Backlog", "Someday", "Done"]
+
+    for owner in sorted(grouped.keys()):
+        print(f"\n{'='*60}")
+        print(f"  {owner.upper()}")
+        print(f"{'='*60}")
+
+        sections = grouped[owner]
+        for sec in section_order:
+            if sec not in sections:
+                continue
+            sec_tasks = sections[sec]
+            print(f"\n  ## {sec} ({len(sec_tasks)})")
+            print(f"  {'-'*40}")
+
+            for t in sec_tasks:
+                char = STATE_CHAR.get(t.state, " ")
+                meta_parts: list[str] = []
+                if t.project:
+                    meta_parts.append(f"project:{t.project}")
+                if t.priority:
+                    meta_parts.append(f"priority:{t.priority}")
+                if t.due:
+                    meta_parts.append(f"due:{t.due}")
+                if t.tags:
+                    meta_parts.append(" ".join(f"#{tag}" for tag in t.tags))
+
+                meta = f"  ({', '.join(meta_parts)})" if meta_parts else ""
+                print(f"  [{char}] {t.title}{meta}")
+
+                if t.description and not args.compact:
+                    for d in t.description[:3]:  # Show first 3 desc lines
+                        print(f"      {d.strip()}")
+                    if len(t.description) > 3:
+                        print(f"      ... ({len(t.description) - 3} more lines)")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    """Add a new task to the specified owner/section."""
+    owner = args.owner.lower()
+    if owner not in TASK_FILES:
+        print(f"Error: Unknown owner '{owner}'. Valid: {', '.join(TASK_FILES.keys())}")
+        sys.exit(1)
+
+    section = args.section.capitalize()
+    if section not in VALID_SECTIONS:
+        print(f"Error: Unknown section '{section}'. Valid: {', '.join(VALID_SECTIONS)}")
+        sys.exit(1)
+
+    filepath = TASK_FILES[owner]
+    if not filepath.exists():
+        print(f"Error: Task file not found: {filepath}")
+        sys.exit(1)
+
+    tags = args.tags.split(",") if args.tags else None
+
+    task_line = build_task_line(
+        title=args.title,
+        state="todo",
+        tags=tags,
+        priority=args.priority,
+        due=args.due,
+        project=args.project,
+        created=TODAY,
+    )
+
+    lines = read_file(filepath)
+    lines = ensure_section_exists(lines, section)
+
+    insert_at = find_insert_point(lines, section)
+    if insert_at == -1:
+        print(f"Error: Could not find section '{section}' in {filepath}")
+        sys.exit(1)
+
+    # Insert with proper spacing
+    new_lines = lines[:insert_at]
+    # Add blank line before if last line is non-empty content (not header, not blank)
+    if new_lines and new_lines[-1].strip() and not new_lines[-1].startswith("##"):
+        # Check if previous task has description (indented lines)
+        # If so, add blank line separator
+        if new_lines[-1].startswith("  "):
+            new_lines.append("")
+    new_lines.append(task_line)
+    new_lines.extend(lines[insert_at:])
+
+    write_file(filepath, new_lines)
+    print(f"✓ Added to {owner}/{section}: {args.title}")
+
+
+def cmd_done(args: argparse.Namespace) -> None:
+    """Mark a task as done, add done date, move to Done section."""
+    all_tasks = load_all_tasks()
+    # Only match open tasks
+    open_tasks = [t for t in all_tasks if t.state in ("todo", "in_progress")]
+
+    task = fuzzy_match_task(open_tasks, args.title)
+    if not task:
+        print(f"Error: No open task matching '{args.title}'")
+        sys.exit(1)
+
+    filepath = TASK_FILES.get(task.owner)
+    if not filepath:
+        # Might be inbox
+        if task.owner == "inbox":
+            filepath = INBOX_FILE
+        else:
+            print(f"Error: Cannot determine file for owner '{task.owner}'")
+            sys.exit(1)
+
+    lines = read_file(filepath)
+
+    # Build the new task line with done state
+    # Parse existing line to preserve tags and fields, then rebuild
+    old_line = lines[task.line_number]
+    m = CHECKBOX_RE.match(old_line)
+    if not m:
+        print(f"Error: Line {task.line_number + 1} is not a valid checkbox line")
+        sys.exit(1)
+
+    content = m.group(2)
+
+    # Replace checkbox state
+    new_line = f"- [x] {content}"
+
+    # Add [done:: DATE] if not already present
+    if "[done::" not in new_line:
+        # Insert before closing of line, after existing fields
+        new_line = new_line.rstrip() + f" [done:: {TODAY}]"
+
+    # Remove the task (and its description) from current position
+    task_end = task.line_number + 1
+    while task_end < len(lines) and lines[task_end].startswith("  ") and not CHECKBOX_RE.match(lines[task_end]):
+        task_end += 1
+
+    removed_lines = [new_line] + lines[task.line_number + 1: task_end]
+
+    # Remove from old position
+    new_file_lines = lines[:task.line_number] + lines[task_end:]
+
+    # Clean up blank lines at removal point
+    while (task.line_number < len(new_file_lines)
+           and task.line_number > 0
+           and new_file_lines[task.line_number - 1].strip() == ""
+           and new_file_lines[task.line_number].strip() == ""):
+        new_file_lines.pop(task.line_number)
+
+    # Ensure Done section exists
+    new_file_lines = ensure_section_exists(new_file_lines, "Done")
+
+    # Find insert point in Done section
+    insert_at = find_insert_point(new_file_lines, "Done")
+    if insert_at == -1:
+        print("Error: Could not find Done section after ensuring it exists")
+        sys.exit(1)
+
+    # Insert task into Done section
+    final_lines = new_file_lines[:insert_at]
+    if final_lines and final_lines[-1].strip() and not final_lines[-1].startswith("##"):
+        if final_lines[-1].startswith("  "):
+            final_lines.append("")
+    final_lines.extend(removed_lines)
+    final_lines.extend(new_file_lines[insert_at:])
+
+    write_file(filepath, final_lines)
+    print(f"✓ Marked done: {task.title}")
+    print(f"  Moved to Done section in {filepath.name}")
+
+
+def cmd_move(args: argparse.Namespace) -> None:
+    """Move a task between sections (Active/Backlog/Someday)."""
+    target_section = args.to.capitalize()
+    if target_section not in VALID_SECTIONS:
+        print(f"Error: Unknown section '{args.to}'. Valid: {', '.join(VALID_SECTIONS)}")
+        sys.exit(1)
+
+    all_tasks = load_all_tasks()
+    task = fuzzy_match_task(all_tasks, args.title)
+    if not task:
+        print(f"Error: No task matching '{args.title}'")
+        sys.exit(1)
+
+    if task.section == target_section:
+        print(f"Task '{task.title}' is already in {target_section}")
+        return
+
+    filepath = TASK_FILES.get(task.owner)
+    if task.owner == "inbox":
+        filepath = INBOX_FILE
+    if not filepath:
+        print(f"Error: Cannot determine file for owner '{task.owner}'")
+        sys.exit(1)
+
+    lines = read_file(filepath)
+
+    # Identify task and description lines
+    task_start = task.line_number
+    task_end = task_start + 1
+    while task_end < len(lines) and lines[task_end].startswith("  ") and not CHECKBOX_RE.match(lines[task_end]):
+        task_end += 1
+
+    removed_lines = lines[task_start:task_end]
+
+    # Remove from old position
+    new_lines = lines[:task_start] + lines[task_end:]
+
+    # Clean up blank lines at removal point
+    while (task_start < len(new_lines)
+           and task_start > 0
+           and new_lines[task_start - 1].strip() == ""
+           and task_start < len(new_lines)
+           and new_lines[task_start].strip() == ""):
+        new_lines.pop(task_start)
+
+    # Ensure target section exists
+    new_lines = ensure_section_exists(new_lines, target_section)
+
+    # Find insert point
+    insert_at = find_insert_point(new_lines, target_section)
+    if insert_at == -1:
+        print(f"Error: Could not find section '{target_section}'")
+        sys.exit(1)
+
+    # Insert
+    final_lines = new_lines[:insert_at]
+    if final_lines and final_lines[-1].strip() and not final_lines[-1].startswith("##"):
+        if final_lines[-1].startswith("  "):
+            final_lines.append("")
+    final_lines.extend(removed_lines)
+    final_lines.extend(new_lines[insert_at:])
+
+    write_file(filepath, final_lines)
+    print(f"✓ Moved '{task.title}' from {task.section} → {target_section}")
+
+
+def cmd_health(args: argparse.Namespace) -> None:
+    """Check for format issues across all task files."""
+    issues: list[str] = []
+    total_tasks = 0
+    files_checked = 0
+
+    all_files = list(TASK_FILES.items())
+    if INBOX_FILE.exists():
+        all_files.append(("inbox", INBOX_FILE))
+
+    for owner, filepath in all_files:
+        if not filepath.exists():
+            issues.append(f"[{owner}] File missing: {filepath}")
+            continue
+
+        files_checked += 1
+        lines = filepath.read_text().splitlines()
+
+        # Check frontmatter
+        if not lines or lines[0].rstrip() != "---":
+            issues.append(f"[{owner}] Missing YAML frontmatter")
+        else:
+            fm_lines, _ = split_frontmatter(lines)
+            if not fm_lines:
+                issues.append(f"[{owner}] Unclosed YAML frontmatter")
+            else:
+                fm_text = "\n".join(fm_lines)
+                if "date:" not in fm_text:
+                    issues.append(f"[{owner}] Frontmatter missing 'date' field")
+                if "updated:" not in fm_text:
+                    issues.append(f"[{owner}] Frontmatter missing 'updated' field")
+
+        # Check sections exist
+        section_headers = set()
+        for line in lines:
+            if line.startswith("## "):
+                section_headers.add(line[3:].strip())
+
+        for sec in ["Active", "Backlog", "Someday", "Done"]:
+            if sec not in section_headers:
+                issues.append(f"[{owner}] Missing section: ## {sec}")
+
+        # Check tasks
+        tasks = parse_tasks(filepath, owner)
+        total_tasks += len(tasks)
+
+        for t in tasks:
+            # Missing created date
+            if not t.created:
+                issues.append(
+                    f"[{owner}] Line {t.line_number + 1}: '{t.title[:40]}' — missing [created::] date"
+                )
+
+            # Done task without done date
+            if t.state == "done" and not t.done_date:
+                issues.append(
+                    f"[{owner}] Line {t.line_number + 1}: '{t.title[:40]}' — done but missing [done::] date"
+                )
+
+            # Done task not in Done section
+            if t.state == "done" and t.section != "Done":
+                issues.append(
+                    f"[{owner}] Line {t.line_number + 1}: '{t.title[:40]}' — done but in {t.section} (should be Done)"
+                )
+
+            # Open task in Done section
+            if t.state in ("todo", "in_progress") and t.section == "Done":
+                issues.append(
+                    f"[{owner}] Line {t.line_number + 1}: '{t.title[:40]}' — open task in Done section"
+                )
+
+            # Malformed checkbox (would have been caught by parser, but check raw)
+            if not CHECKBOX_RE.match(t.raw_line):
+                issues.append(
+                    f"[{owner}] Line {t.line_number + 1}: Malformed checkbox line"
+                )
+
+    # Report
+    print(f"Vault Task Health Check")
+    print(f"{'='*50}")
+    print(f"Files checked: {files_checked}")
+    print(f"Total tasks:   {total_tasks}")
+    print()
+
+    if not issues:
+        print("✓ No issues found!")
+    else:
+        print(f"⚠ Found {len(issues)} issue(s):\n")
+        for issue in issues:
+            print(f"  • {issue}")
+
+    sys.exit(0 if not issues else 1)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="task",
+        description="CLI for Argos vault-format task operations",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  task list
+  task list --owner work --section active
+  task add --owner agent --section active "Build new feature" --tags dev,automation
+  task done "Build new feature"
+  task move "Build new feature" --to done
+  task health
+""",
+    )
+
+    parser.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # list
+    p_list = sub.add_parser("list", help="List tasks")
+    p_list.add_argument("--owner", "-o", help="Filter by owner (work/personal/agent)")
+    p_list.add_argument("--section", "-s", help="Filter by section (Active/Backlog/Someday/Done)")
+    p_list.add_argument("--compact", "-c", action="store_true", help="Hide descriptions")
+
+    # add
+    p_add = sub.add_parser("add", help="Add a new task")
+    p_add.add_argument("--owner", "-o", required=True, help="Task owner (work/personal/agent)")
+    p_add.add_argument("--section", "-s", required=True, help="Section (active/backlog/someday)")
+    p_add.add_argument("title", help="Task title")
+    p_add.add_argument("--due", help="Due date (YYYY-MM-DD)")
+    p_add.add_argument("--project", help="Project name")
+    p_add.add_argument("--priority", choices=["high", "medium", "low"], help="Priority level")
+    p_add.add_argument("--tags", help="Comma-separated tags")
+
+    # done
+    p_done = sub.add_parser("done", help="Mark a task as done")
+    p_done.add_argument("title", help="Task title (fuzzy match)")
+
+    # move
+    p_move = sub.add_parser("move", help="Move task between sections")
+    p_move.add_argument("title", help="Task title (fuzzy match)")
+    p_move.add_argument("--to", required=True, help="Target section (Active/Backlog/Someday/Done)")
+
+    # health
+    sub.add_parser("health", help="Check for format issues")
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    configure_vault_paths(resolve_vault_dir(args.vault_dir))
+
+    commands = {
+        "list": cmd_list,
+        "add": cmd_add,
+        "done": cmd_done,
+        "move": cmd_move,
+        "health": cmd_health,
+    }
+
+    cmd_fn = commands.get(args.command)
+    if cmd_fn:
+        cmd_fn(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

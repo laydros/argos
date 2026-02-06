@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+"""
+Task management CLI for Zag.
+
+Enforces proper task structure and provides query capabilities.
+
+Usage:
+    task add --owner work --bucket active "Fix the thing"
+    task add --owner personal --bucket inbox "Buy milk" --due 2026-02-15
+    task list [--owner OWNER] [--bucket BUCKET]
+    task move "Task title" --to backlog
+    task done "Task title"
+    task sweep
+    task projects
+    task project "Project Name"
+    task health  # Check for issues
+"""
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+def resolve_tasks_dir() -> Path:
+    env_override = os.environ.get('TASKS_DIR')
+    if env_override:
+        return Path(env_override).expanduser()
+    if sys.platform == 'darwin':
+        return Path(os.path.expanduser('~/var/zag-openclaw-config/workspace/tasks'))
+    return Path(os.path.expanduser('~/.openclaw/workspace/tasks'))
+
+TASKS_DIR = resolve_tasks_dir()
+VALID_OWNERS = ['work', 'personal', 'zag']
+VALID_BUCKETS = ['active', 'backlog', 'someday', 'inbox']
+PROJECTS_FILE = TASKS_DIR / 'projects.md'
+COMPLETED_HEADER = (
+    "# Completed\n\n"
+    "Recent completed tasks (most recent on top). Archived overnight.\n\n"
+)
+HISTORY_HEADER = (
+    "# History\n\n"
+    "Done tasks (most recent on top).\n\n"
+)
+
+def normalize_completed_content(content: str) -> tuple[str, str]:
+    """Return standardized header + remaining content."""
+    if content.startswith("# Completed"):
+        parts = content.split("\n\n", 2)
+        if len(parts) >= 3:
+            return COMPLETED_HEADER, parts[2]
+        return COMPLETED_HEADER, ''
+    return COMPLETED_HEADER, content
+
+def normalize_history_content(content: str) -> tuple[str, str]:
+    """Return standardized header + remaining content."""
+    if content.startswith("# History"):
+        parts = content.split("\n\n", 2)
+        if len(parts) >= 3:
+            return HISTORY_HEADER, parts[2]
+        return HISTORY_HEADER, ''
+    return HISTORY_HEADER, content
+
+def insert_history_entries(history_file: Path, entries: list[str]) -> None:
+    """Insert entries immediately after the history header."""
+    block = ''.join(entries)
+    if not history_file.exists():
+        history_file.write_text(HISTORY_HEADER + block)
+        return
+    content = history_file.read_text()
+    header, rest = normalize_history_content(content)
+    history_file.write_text(header + block + rest)
+
+def get_task_file(owner: str, bucket: str) -> Path:
+    """Get the path to a task file."""
+    if bucket == 'inbox':
+        return TASKS_DIR / 'inbox.md'
+    return TASKS_DIR / owner / f'{bucket}.md'
+
+def ensure_structure():
+    """Ensure the task directory structure exists."""
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    for owner in VALID_OWNERS:
+        owner_dir = TASKS_DIR / owner
+        owner_dir.mkdir(exist_ok=True)
+        for bucket in ['active', 'backlog', 'someday']:
+            task_file = owner_dir / f'{bucket}.md'
+            if not task_file.exists():
+                task_file.write_text(f'# {owner.title()} - {bucket.title()}\n\n')
+    
+    inbox = TASKS_DIR / 'inbox.md'
+    if not inbox.exists():
+        inbox.write_text('# Inbox\n\nUnsorted tasks to triage.\n\n')
+
+    if not PROJECTS_FILE.exists():
+        PROJECTS_FILE.write_text('# Projects\n\n')
+
+    migrate_completed_to_history()
+
+def migrate_completed_to_history() -> None:
+    """Migrate legacy completed.md to history.md if needed."""
+    history_file = TASKS_DIR / 'history.md'
+    if history_file.exists():
+        return
+    completed_file = TASKS_DIR / 'completed.md'
+    if not completed_file.exists():
+        return
+    content = completed_file.read_text()
+    _, rest = normalize_completed_content(content)
+    history_file.write_text(HISTORY_HEADER + rest)
+
+def normalize_project_name(name: str) -> str:
+    return name.strip().lower()
+
+def parse_projects_registry() -> list[dict]:
+    """Parse projects from tasks/projects.md."""
+    if not PROJECTS_FILE.exists():
+        return []
+
+    content = PROJECTS_FILE.read_text()
+    projects = []
+
+    sections = re.split(r'^## ', content, flags=re.MULTILINE)
+    for section in sections[1:]:
+        lines = section.strip().split('\n')
+        if not lines:
+            continue
+
+        name = lines[0].strip()
+        body_lines = lines[1:]
+        status = None
+        description = None
+        notes = []
+
+        for line in body_lines:
+            status_match = re.match(r'^\*\*Status:\*\*\s*(.+)', line)
+            if status_match:
+                status = status_match.group(1).strip()
+                continue
+            description_match = re.match(r'^\*\*Description:\*\*\s*(.+)', line)
+            if description_match:
+                description = description_match.group(1).strip()
+                continue
+            notes.append(line)
+
+        notes_text = '\n'.join(notes).strip()
+        projects.append({
+            'name': name,
+            'status': status or 'Active',
+            'description': description or '',
+            'notes': notes_text
+        })
+
+    return projects
+
+def find_project_entry(projects: list[dict], name: str):
+    target = normalize_project_name(name)
+    for project in projects:
+        if normalize_project_name(project['name']) == target:
+            return project
+    return None
+
+def ensure_project_in_registry(name: str) -> str:
+    """Ensure a project exists in registry, return canonical name."""
+    ensure_structure()
+    projects = parse_projects_registry()
+    existing = find_project_entry(projects, name)
+    if existing:
+        return existing['name']
+
+    entry = (
+        f"## {name}\n\n"
+        f"**Status:** Active\n"
+        f"**Description:** Auto-created from task add.\n\n"
+    )
+    content = PROJECTS_FILE.read_text()
+    prefix = '' if content.endswith('\n\n') or content == '' else '\n'
+    with open(PROJECTS_FILE, 'a') as f:
+        f.write(prefix + entry)
+    return name
+
+def parse_tasks(filepath: Path) -> list[dict]:
+    """Parse tasks from a markdown file."""
+    if not filepath.exists():
+        return []
+
+    content = filepath.read_text()
+    _, tasks = parse_task_sections(content)
+    return tasks
+
+def is_done_status(status: str) -> bool:
+    """Return True if a status indicates completion."""
+    if not status:
+        return False
+    if '✅' in status:
+        return True
+    if re.search(r'\bdone\b', status.lower()):
+        return True
+    return re.search(r'\bcomplete(d)?\b', status.lower()) is not None
+
+def is_done_title(title: str) -> bool:
+    """Return True if a title already includes a done marker."""
+    if not title:
+        return False
+    return title.strip().startswith('✅')
+
+def ensure_done_title(title: str) -> str:
+    """Ensure a title is prefixed with a done marker."""
+    if not title:
+        return title
+    trimmed = title.strip()
+    if trimmed.startswith('✅'):
+        return trimmed
+    return f"✅ {trimmed}"
+
+def is_done_task(task: dict) -> bool:
+    """Return True if a task is done based on status/title/section."""
+    if not task:
+        return False
+    if task.get('done_section'):
+        return True
+    if is_done_title(task.get('title', '')):
+        return True
+    return is_done_status(task.get('status', '') or '')
+
+def parse_task_sections(content: str) -> tuple[str, list[dict]]:
+    """Parse task sections preserving headers for rebuild."""
+    lines = content.splitlines()
+    header_lines: list[str] = []
+    tasks: list[dict] = []
+    current = None
+    seen_task_header = False
+    in_done_section = False
+
+    def finalize_current():
+        if not current:
+            return
+        body = '\n'.join(current['body_lines']).strip()
+        status_match = re.search(r'\*\*Status:\*\*\s*(.+)', body)
+        status = status_match.group(1).strip() if status_match else None
+        project_match = re.search(r'\*\*Project:\*\*\s*(.+)', body)
+        project = project_match.group(1).strip() if project_match else None
+        due_match = re.search(r'\*\*Due:\*\*\s*(.+)', body)
+        due = due_match.group(1).strip() if due_match else None
+        tasks.append({
+            'title': current['title'],
+            'body': body,
+            'status': status,
+            'project': project,
+            'due': due,
+            'done_section': current['done_section']
+        })
+
+    for line in lines:
+        if line.startswith('## '):
+            title = line[3:].strip()
+            if title.lower() == 'done':
+                finalize_current()
+                current = None
+                seen_task_header = True
+                in_done_section = True
+                continue
+            if not seen_task_header:
+                seen_task_header = True
+            else:
+                finalize_current()
+            current = {
+                'title': title,
+                'body_lines': [],
+                'done_section': in_done_section
+            }
+            continue
+
+        if not seen_task_header:
+            header_lines.append(line)
+            continue
+
+        if current is not None:
+            current['body_lines'].append(line)
+
+    finalize_current()
+
+    header = '\n'.join(header_lines).rstrip()
+    return header, tasks
+
+def rebuild_task_content(header: str, tasks: list[dict], fallback_header: str) -> str:
+    """Rebuild markdown task file content with Done grouping."""
+    header_text = header.strip() if header.strip() else fallback_header
+    content = f"{header_text}\n\n" if header_text else ''
+    pending: list[dict] = []
+    done: list[dict] = []
+
+    for task in tasks:
+        if is_done_task(task):
+            done.append(task)
+        else:
+            pending.append(task)
+
+    def append_task(task: dict, force_done_prefix: bool = False) -> None:
+        nonlocal content
+        title = ensure_done_title(task['title']) if force_done_prefix else task['title']
+        content += f"## {title}\n\n"
+        if task['body']:
+            content += f"{task['body']}\n\n"
+        else:
+            content += "\n"
+
+    for task in pending:
+        append_task(task)
+
+    if done:
+        content += "## Done\n\n"
+        for task in done:
+            append_task(task, force_done_prefix=True)
+
+    return content
+
+def strip_task_metadata(body: str) -> str:
+    """Remove task metadata lines (status/project/due/done/etc) for history notes."""
+    if not body:
+        return ''
+    kept = []
+    for line in body.splitlines():
+        if re.match(r'^\s*\*{0,2}(Status|Project|Due|Done|From|Completed)[:\*]', line, re.IGNORECASE):
+            continue
+        kept.append(line)
+    return '\n'.join(kept).strip()
+
+def parse_done_timestamp(body: str):
+    """Parse **Done:** timestamp from body."""
+    if not body:
+        return None
+    match = re.search(r'\*\*Done:\*\*\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})', body)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), '%Y-%m-%d %H:%M')
+    except ValueError:
+        return None
+
+def get_done_window_days() -> int:
+    """Return the visibility window in days."""
+    raw = os.environ.get('TASK_DONE_DAYS')
+    if not raw:
+        return 2
+    try:
+        value = int(raw)
+        return value if value > 0 else 2
+    except ValueError:
+        return 2
+
+def ensure_done_metadata(body: str, timestamp: str) -> str:
+    """Ensure Status: Done and Done timestamp exist."""
+    lines = body.splitlines() if body else []
+    done_exists = any(re.match(r'^\*\*Done:\*\*', line) for line in lines)
+    status_found = False
+    updated = []
+    for line in lines:
+        if re.match(r'^\*\*Status:\*\*', line):
+            updated.append('**Status:** Done')
+            status_found = True
+            if not done_exists:
+                updated.append(f'**Done:** {timestamp}')
+                done_exists = True
+            continue
+        if re.match(r'^\*\*Done:\*\*', line):
+            updated.append(line)
+            done_exists = True
+            continue
+        updated.append(line)
+    if not status_found:
+        updated.insert(0, '**Status:** Done')
+        if not done_exists:
+            updated.insert(1, f'**Done:** {timestamp}')
+    return '\n'.join(updated).strip()
+
+def extract_task_metadata(body: str) -> dict:
+    """Extract common metadata from task body."""
+    fields = {}
+    if not body:
+        return fields
+    status_match = re.search(r'\*\*Status:\*\*\s*(.+)', body)
+    if status_match:
+        fields['status'] = status_match.group(1).strip()
+    project_match = re.search(r'\*\*Project:\*\*\s*(.+)', body)
+    if project_match:
+        fields['project'] = project_match.group(1).strip()
+    due_match = re.search(r'\*\*Due:\*\*\s*(.+)', body)
+    if due_match:
+        fields['due'] = due_match.group(1).strip()
+    done_match = re.search(r'\*\*Done:\*\*\s*(.+)', body)
+    if done_match:
+        fields['done'] = done_match.group(1).strip()
+    return fields
+
+def format_task(title: str, status: str = 'Active', project: str = None, 
+                due: str = None, notes: str = None) -> str:
+    """Format a task as markdown."""
+    lines = [f'## {title}', '']
+    lines.append(f'**Status:** {status}')
+    
+    if project:
+        lines.append(f'**Project:** {project}')
+    if due:
+        lines.append(f'**Due:** {due}')
+    
+    lines.append('')
+    if notes:
+        lines.append(notes)
+    
+    return '\n'.join(lines) + '\n\n'
+
+def cmd_add(args):
+    """Add a new task."""
+    ensure_structure()
+    
+    # Validate
+    if args.owner not in VALID_OWNERS:
+        print(f"Error: owner must be one of {VALID_OWNERS}", file=sys.stderr)
+        sys.exit(1)
+    if args.bucket not in VALID_BUCKETS:
+        print(f"Error: bucket must be one of {VALID_BUCKETS}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Get file path
+    filepath = get_task_file(args.owner, args.bucket)
+
+    project_name = None
+    if args.project:
+        project_name = ensure_project_in_registry(args.project)
+    
+    # Format task
+    task_md = format_task(
+        title=args.title,
+        status='Active' if args.bucket == 'active' else 'Pending',
+        project=project_name,
+        due=args.due,
+        notes=args.notes
+    )
+    
+    # Append to file
+    with open(filepath, 'a') as f:
+        f.write(task_md)
+    
+    print(f"✓ Added to {args.owner}/{args.bucket}: {args.title}")
+    if args.due:
+        print(f"  Due: {args.due}")
+    if project_name:
+        print(f"  Project: {project_name}")
+
+def cmd_list(args):
+    """List tasks with optional filters."""
+    ensure_structure()
+    
+    owners = [args.owner] if args.owner else VALID_OWNERS
+    buckets = [args.bucket] if args.bucket else ['active', 'backlog', 'someday']
+    project_filter = args.project.lower() if args.project else None
+
+    def format_list_title(task: dict) -> str:
+        title = task.get('title', '')
+        if is_done_task(task) and not is_done_title(title):
+            return f"✅ {title}"
+        return title
+
+    total = 0
+    for owner in owners:
+        for bucket in buckets:
+            filepath = get_task_file(owner, bucket)
+            tasks = parse_tasks(filepath)
+            
+            # Filter by project if specified
+            if project_filter:
+                tasks = [t for t in tasks if t.get('project', '').lower() == project_filter]
+            
+            if tasks:
+                print(f"\n## {owner}/{bucket} ({len(tasks)})")
+                for task in tasks:
+                    due_str = f" [due: {task['due']}]" if task.get('due') else ""
+                    proj_str = f" ({task['project']})" if task.get('project') else ""
+                    title = format_list_title(task)
+                    print(f"  - {title}{proj_str}{due_str}")
+                total += len(tasks)
+    
+    # Also check inbox (only if no project filter, since inbox tasks rarely have projects)
+    if not args.owner and not args.bucket and not project_filter:
+        inbox = TASKS_DIR / 'inbox.md'
+        inbox_tasks = parse_tasks(inbox)
+        if inbox_tasks:
+            print(f"\n## inbox ({len(inbox_tasks)})")
+            for task in inbox_tasks:
+                title = format_list_title(task)
+                print(f"  - {title}")
+            total += len(inbox_tasks)
+    
+    print(f"\nTotal: {total} tasks")
+
+
+def cmd_projects(args):
+    """List all projects in use across tasks."""
+    ensure_structure()
+
+    registry = parse_projects_registry()
+    if not registry:
+        print("No projects in registry. Add entries to tasks/projects.md.")
+        return
+
+    counts = {normalize_project_name(p['name']): {'total': 0} for p in registry}
+
+    for owner in VALID_OWNERS:
+        for bucket in ['active', 'backlog', 'someday']:
+            filepath = get_task_file(owner, bucket)
+            tasks = parse_tasks(filepath)
+            for task in tasks:
+                proj = task.get('project')
+                if not proj:
+                    continue
+                key = normalize_project_name(proj)
+                if key in counts:
+                    counts[key]['total'] += 1
+
+    # Include inbox tasks with projects
+    for task in parse_tasks(TASKS_DIR / 'inbox.md'):
+        proj = task.get('project')
+        if not proj:
+            continue
+        key = normalize_project_name(proj)
+        if key in counts:
+            counts[key]['total'] += 1
+
+    print("Projects:")
+    print("=" * 60)
+
+    name_width = max(len(p['name']) for p in registry)
+    status_width = max(len(p['status']) for p in registry)
+
+    for project in registry:
+        key = normalize_project_name(project['name'])
+        total = counts.get(key, {}).get('total', 0)
+        count_label = f"{total} task" if total == 1 else f"{total} tasks"
+        print(f"  {project['name'].ljust(name_width)}  {project['status'].ljust(status_width)}  {count_label}")
+
+    print(f"\nTotal: {len(registry)} projects")
+
+def find_task_matches(query: str) -> list[dict]:
+    """Find matching tasks across all buckets and owners."""
+    matches = []
+    q = query.lower()
+    for owner in VALID_OWNERS:
+        for bucket in ['active', 'backlog', 'someday']:
+            filepath = get_task_file(owner, bucket)
+            tasks = parse_tasks(filepath)
+            for task in tasks:
+                if q in task['title'].lower():
+                    matches.append({
+                        'task': task,
+                        'file': filepath,
+                        'owner': owner,
+                        'bucket': bucket
+                    })
+    inbox = TASKS_DIR / 'inbox.md'
+    for task in parse_tasks(inbox):
+        if q in task['title'].lower():
+            matches.append({
+                'task': task,
+                'file': inbox,
+                'owner': 'inbox',
+                'bucket': 'inbox'
+            })
+    return matches
+
+def require_single_match(matches: list[dict], query: str):
+    """Ensure a single match; otherwise error with details."""
+    if not matches:
+        print(f"Error: Task matching '{query}' not found", file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"Error: '{query}' matched multiple tasks. Be more specific:", file=sys.stderr)
+        for match in matches:
+            task = match['task']
+            print(f"  - {task['title']} ({match['owner']}/{match['bucket']})", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]
+
+def cmd_move(args):
+    """Move a task to a different bucket or owner."""
+    ensure_structure()
+    
+    match = require_single_match(find_task_matches(args.title), args.title)
+    found = match['task']
+    source_file = match['file']
+    source_owner = match['owner']
+    source_bucket = match['bucket']
+    
+    # Determine destination
+    dest_owner = args.to_owner or source_owner
+    dest_bucket = args.to_bucket or source_bucket
+    
+    if source_bucket == 'inbox':
+        if not args.to_owner or not args.to_bucket:
+            print("Error: Moving from inbox requires --to-owner and --to-bucket", file=sys.stderr)
+            sys.exit(1)
+        dest_owner = args.to_owner
+        dest_bucket = args.to_bucket
+    
+    if dest_owner == 'inbox':
+        dest_owner = source_owner  # Can't move to inbox owner
+        
+    dest_file = get_task_file(dest_owner, dest_bucket)
+    
+    # Remove from source (rewrite file without this task)
+    content = source_file.read_text()
+    # Find and remove the task section
+    pattern = rf'^## {re.escape(found["title"])}.*?(?=^## |\Z)'
+    new_content = re.sub(pattern, '', content, flags=re.MULTILINE | re.DOTALL, count=1)
+    source_file.write_text(new_content)
+    
+    # Add to destination
+    task_md = format_task(
+        title=found['title'],
+        status='Active' if dest_bucket == 'active' else found.get('status', 'Pending'),
+        project=found.get('project'),
+        due=found.get('due'),
+        notes=found.get('body', '').split('\n\n', 1)[-1] if '\n\n' in found.get('body', '') else None
+    )
+    
+    with open(dest_file, 'a') as f:
+        f.write(task_md)
+    
+    print(f"✓ Moved '{found['title']}' from {source_owner}/{source_bucket} to {dest_owner}/{dest_bucket}")
+
+def cmd_done(args):
+    """Mark a task as done - keeps in place with Done timestamp."""
+    ensure_structure()
+    
+    match = require_single_match(find_task_matches(args.title), args.title)
+    found = match['task']
+    source_file = match['file']
+    source_location = f"{match['owner']}/{match['bucket']}"
+    
+    content = source_file.read_text() if source_file.exists() else ''
+    header, tasks = parse_task_sections(content)
+    updated = False
+    now = datetime.now()
+    for task in tasks:
+        if task['title'] == found['title']:
+            task['body'] = ensure_done_metadata(task.get('body', ''), now.strftime('%Y-%m-%d %H:%M'))
+            task['title'] = ensure_done_title(task.get('title', ''))
+            task['status'] = 'Done'
+            updated = True
+            break
+    if updated:
+        if match['bucket'] == 'inbox':
+            fallback_header = "# Inbox"
+        else:
+            fallback_header = f"# {match['owner'].title()} - {match['bucket'].title()}"
+        source_file.write_text(rebuild_task_content(header, tasks, fallback_header))
+    
+    print(f"✓ Done: {found['title']}")
+    print(f"  (kept in {source_location} for {get_done_window_days()} days)")
+
+def sweep_completed_tasks():
+    """Move done-status tasks older than window into history.md."""
+    ensure_structure()
+
+    moved = []
+    counts: dict[tuple[str, str], int] = {}
+
+    for owner in VALID_OWNERS:
+        for bucket in ['active', 'backlog', 'someday']:
+            filepath = get_task_file(owner, bucket)
+            content = filepath.read_text() if filepath.exists() else ''
+            header, tasks = parse_task_sections(content)
+            kept = []
+
+            for task in tasks:
+                if is_done_task(task):
+                    done_dt = parse_done_timestamp(task.get('body', ''))
+                    if not done_dt:
+                        kept.append(task)
+                        continue
+                    window_days = get_done_window_days()
+                    if (datetime.now() - done_dt).days < window_days:
+                        kept.append(task)
+                        continue
+                    moved.append({
+                        'title': task['title'],
+                        'owner': owner,
+                        'bucket': bucket,
+                        'body': task.get('body', '')
+                    })
+                    counts[(owner, bucket)] = counts.get((owner, bucket), 0) + 1
+                else:
+                    kept.append(task)
+
+            if len(kept) != len(tasks):
+                fallback_header = f"# {owner.title()} - {bucket.title()}"
+                filepath.write_text(rebuild_task_content(header, kept, fallback_header))
+
+    inbox_file = TASKS_DIR / 'inbox.md'
+    inbox_content = inbox_file.read_text() if inbox_file.exists() else ''
+    inbox_header, inbox_tasks = parse_task_sections(inbox_content)
+    inbox_kept = []
+    for task in inbox_tasks:
+        if is_done_task(task):
+            done_dt = parse_done_timestamp(task.get('body', ''))
+            if not done_dt:
+                inbox_kept.append(task)
+                continue
+            window_days = get_done_window_days()
+            if (datetime.now() - done_dt).days < window_days:
+                inbox_kept.append(task)
+                continue
+            moved.append({
+                'title': task['title'],
+                'owner': 'inbox',
+                'bucket': 'inbox',
+                'body': task.get('body', '')
+            })
+            counts[('inbox', 'inbox')] = counts.get(('inbox', 'inbox'), 0) + 1
+        else:
+            inbox_kept.append(task)
+    if len(inbox_kept) != len(inbox_tasks):
+        inbox_file.write_text(rebuild_task_content(inbox_header, inbox_kept, "# Inbox"))
+
+    if moved:
+        history_file = TASKS_DIR / 'history.md'
+        history_entries = []
+        for task in moved:
+            meta = extract_task_metadata(task.get('body', ''))
+            notes = strip_task_metadata(task.get('body', ''))
+            done_stamp = meta.get('done', datetime.now().strftime('%Y-%m-%d %H:%M'))
+            history_title = ensure_done_title(task['title'])
+            history_entry = f"""## {history_title}
+
+**Done:** {done_stamp}
+**From:** {task['owner']}/{task['bucket']}
+"""
+            if meta.get('project'):
+                history_entry += f"**Project:** {meta['project']}\n"
+            if meta.get('due'):
+                history_entry += f"**Due:** {meta['due']}\n"
+            history_entry += "\n"
+            if notes:
+                history_entry += f"{notes}\n\n"
+            else:
+                history_entry += "\n"
+            history_entries.append(history_entry)
+        insert_history_entries(history_file, history_entries)
+
+    return counts, len(moved)
+
+def cmd_sweep(args):
+    """Sweep done-status tasks into history.md."""
+    counts, total = sweep_completed_tasks()
+    if total == 0:
+        print("No done tasks found to sweep")
+        return
+    print(f"✓ Swept {total} done task(s)")
+    for owner in VALID_OWNERS:
+        for bucket in ['active', 'backlog', 'someday']:
+            count = counts.get((owner, bucket), 0)
+            if count:
+                print(f"  {owner}/{bucket}: {count}")
+    inbox_count = counts.get(('inbox', 'inbox'), 0)
+    if inbox_count:
+        print(f"  inbox/inbox: {inbox_count}")
+
+def cmd_archive(args):
+    """Archive disabled."""
+    ensure_structure()
+    print("Archive disabled; use history log.")
+
+def cmd_health(args):
+    """Check task system health."""
+    ensure_structure()
+    
+    issues = []
+    stats = {'total': 0, 'active': 0, 'backlog': 0, 'someday': 0, 'inbox': 0}
+    
+    for owner in VALID_OWNERS:
+        for bucket in ['active', 'backlog', 'someday']:
+            filepath = get_task_file(owner, bucket)
+            tasks = parse_tasks(filepath)
+            stats['total'] += len(tasks)
+            stats[bucket] += len(tasks)
+            
+            for task in tasks:
+                # Check for missing status
+                if not task.get('status'):
+                    issues.append(f"Missing status: {owner}/{bucket} - {task['title']}")
+    
+    # Check inbox
+    inbox_tasks = parse_tasks(TASKS_DIR / 'inbox.md')
+    stats['inbox'] = len(inbox_tasks)
+    stats['total'] += len(inbox_tasks)
+    
+    if inbox_tasks:
+        issues.append(f"Inbox has {len(inbox_tasks)} items to triage")
+    
+    print("Task System Health Check")
+    print("=" * 40)
+    print(f"Total tasks: {stats['total']}")
+    print(f"  Active:  {stats['active']}")
+    print(f"  Backlog: {stats['backlog']}")
+    print(f"  Someday: {stats['someday']}")
+    print(f"  Inbox:   {stats['inbox']}")
+    print()
+    
+    if issues:
+        print("Issues found:")
+        for issue in issues:
+            print(f"  ⚠ {issue}")
+    else:
+        print("✓ No issues found")
+
+def cmd_project(args):
+    """Show details for a single project and its tasks."""
+    ensure_structure()
+
+    registry = parse_projects_registry()
+    if not registry:
+        print("No projects in registry. Add entries to tasks/projects.md.")
+        return
+
+    project = find_project_entry(registry, args.name)
+    if not project:
+        print(f"Error: Project '{args.name}' not found in registry.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"## {project['name']}")
+    print(f"**Status:** {project['status']}")
+    print(f"**Description:** {project['description']}")
+    if project['notes']:
+        print(f"\n{project['notes']}")
+
+    matches = []
+    target = normalize_project_name(project['name'])
+    for owner in VALID_OWNERS:
+        for bucket in ['active', 'backlog', 'someday']:
+            filepath = get_task_file(owner, bucket)
+            tasks = parse_tasks(filepath)
+            for task in tasks:
+                proj = task.get('project')
+                if proj and normalize_project_name(proj) == target:
+                    matches.append((owner, bucket, task['title']))
+
+    # Include inbox if it contains project tasks
+    for task in parse_tasks(TASKS_DIR / 'inbox.md'):
+        proj = task.get('project')
+        if proj and normalize_project_name(proj) == target:
+            matches.append(('inbox', 'inbox', task['title']))
+
+    print("\nTasks:")
+    if not matches:
+        print("  (no tasks)")
+        return
+
+    for owner, bucket, title in matches:
+        print(f"  [{owner}/{bucket}] {title}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Task management CLI for Zag')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    
+    # add
+    add_parser = subparsers.add_parser('add', help='Add a new task')
+    add_parser.add_argument('title', help='Task title')
+    add_parser.add_argument('--owner', '-o', required=True, 
+                           choices=VALID_OWNERS, help='Task owner')
+    add_parser.add_argument('--bucket', '-b', required=True,
+                           choices=VALID_BUCKETS, help='Priority bucket')
+    add_parser.add_argument('--project', '-p', help='Related project')
+    add_parser.add_argument('--due', '-d', help='Due date (only for real deadlines)')
+    add_parser.add_argument('--notes', '-n', help='Additional notes')
+    add_parser.set_defaults(func=cmd_add)
+    
+    # list
+    list_parser = subparsers.add_parser('list', help='List tasks')
+    list_parser.add_argument('--owner', '-o', choices=VALID_OWNERS, help='Filter by owner')
+    list_parser.add_argument('--bucket', '-b', choices=['active', 'backlog', 'someday'],
+                            help='Filter by bucket')
+    list_parser.add_argument('--project', '-p', help='Filter by project name')
+    list_parser.set_defaults(func=cmd_list)
+    
+    # projects
+    projects_parser = subparsers.add_parser('projects', help='List all projects in use')
+    projects_parser.set_defaults(func=cmd_projects)
+
+    # project
+    project_parser = subparsers.add_parser('project', help='Show a project and its tasks')
+    project_parser.add_argument('name', help='Project name (case-insensitive)')
+    project_parser.set_defaults(func=cmd_project)
+    
+    # move
+    move_parser = subparsers.add_parser('move', help='Move a task')
+    move_parser.add_argument('title', help='Task title (partial match)')
+    move_parser.add_argument('--to-owner', choices=VALID_OWNERS, help='New owner')
+    move_parser.add_argument('--to-bucket', choices=['active', 'backlog', 'someday'],
+                            help='New bucket')
+    move_parser.set_defaults(func=cmd_move)
+    
+    # done
+    done_parser = subparsers.add_parser('done', help='Mark task as done')
+    done_parser.add_argument('title', help='Task title (partial match)')
+    done_parser.set_defaults(func=cmd_done)
+    
+    # health
+    health_parser = subparsers.add_parser('health', help='Check task system health')
+    health_parser.set_defaults(func=cmd_health)
+    
+    # archive
+    archive_parser = subparsers.add_parser('archive', help='Archive disabled; use history log')
+    archive_parser.set_defaults(func=cmd_archive)
+
+    # sweep
+    sweep_parser = subparsers.add_parser('sweep', help='Move done tasks into history.md')
+    sweep_parser.set_defaults(func=cmd_sweep)
+    
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == '__main__':
+    main()
