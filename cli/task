@@ -7,7 +7,7 @@ See: obnotes/reference/task-format-spec.md for the canonical format.
 Usage examples:
     task list                          # All tasks, all owners
     task list --owner work             # Work tasks only
-    task list --owner agent --section active
+    task list --owner zag --section active
     task add --owner work --section active "Fix DNS on charon-01" --project dr --priority high
     task add --owner personal --section backlog "Call dentist" --due 2026-03-01 --tags health,appointment
     task done "Fix DNS"                # Fuzzy match, marks done, moves to Done section
@@ -89,7 +89,7 @@ def configure_vault_paths(vault_dir: Path) -> None:
     TASK_FILES = {
         "work": VAULT_DIR / "work/work-tasks.md",
         "personal": VAULT_DIR / "personal/personal-tasks.md",
-        "agent": VAULT_DIR / "zag/zag-tasks.md",
+        "zag": VAULT_DIR / "zag/zag-tasks.md",
     }
     INBOX_FILE = VAULT_DIR / "inbox.md"
 
@@ -786,7 +786,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   task list
   task list --owner work --section active
-  task add --owner agent --section active "Build new feature" --tags dev,automation
+  task add --owner zag --section active "Build new feature" --tags dev,automation
   task done "Build new feature"
   task move "Build new feature" --to done
   task health
@@ -802,13 +802,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     # list
     p_list = sub.add_parser("list", help="List tasks")
-    p_list.add_argument("--owner", "-o", help="Filter by owner (work/personal/agent)")
+    p_list.add_argument("--owner", "-o", help="Filter by owner (work/personal/zag)")
     p_list.add_argument("--section", "-s", help="Filter by section (Active/Backlog/Someday/Done)")
     p_list.add_argument("--compact", "-c", action="store_true", help="Hide descriptions")
 
     # add
     p_add = sub.add_parser("add", help="Add a new task")
-    p_add.add_argument("--owner", "-o", required=True, help="Task owner (work/personal/agent)")
+    p_add.add_argument("--owner", "-o", required=True, help="Task owner (work/personal/zag)")
     p_add.add_argument("--section", "-s", required=True, help="Section (active/backlog/someday)")
     p_add.add_argument("title", help="Task title")
     p_add.add_argument("--due", help="Due date (YYYY-MM-DD)")
