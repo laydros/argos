@@ -633,6 +633,163 @@ def cmd_done(args: argparse.Namespace) -> None:
     print(f"  Moved to Done section in {filepath.name}")
 
 
+def cmd_edit(args: argparse.Namespace) -> None:
+    """Edit properties of an existing task in-place."""
+    if not any(
+        [
+            args.new_title,
+            args.due is not None,
+            args.project is not None,
+            args.priority is not None,
+            args.tags is not None,
+            args.add_tag,
+            args.remove_tag,
+            args.description is not None,
+            args.add_description,
+            args.clear_description,
+        ]
+    ):
+        if hasattr(args, "_parser"):
+            args._parser.print_help()
+        else:
+            print("Error: At least one modification flag is required.")
+        sys.exit(1)
+
+    all_tasks = load_all_tasks()
+    task = fuzzy_match_task(all_tasks, args.title_query)
+    if not task:
+        print(f"Error: No task matching '{args.title_query}'")
+        sys.exit(1)
+
+    filepath = TASK_FILES.get(task.owner)
+    if task.owner == "inbox":
+        filepath = INBOX_FILE
+    if not filepath:
+        print(f"Error: Cannot determine file for owner '{task.owner}'")
+        sys.exit(1)
+
+    lines = read_file(filepath)
+
+    task_start = task.line_number
+    if task_start >= len(lines) or not CHECKBOX_RE.match(lines[task_start]):
+        print(f"Error: Line {task_start + 1} is not a valid checkbox line")
+        sys.exit(1)
+
+    task_end = task_start + 1
+    while (
+        task_end < len(lines)
+        and lines[task_end].startswith("  ")
+        and not CHECKBOX_RE.match(lines[task_end])
+    ):
+        task_end += 1
+
+    existing_desc = lines[task_start + 1:task_end]
+
+    new_title = args.new_title if args.new_title else task.title
+
+    new_tags = task.tags[:] if task.tags else []
+    if args.tags is not None:
+        new_tags = [
+            t.strip().lstrip("#")
+            for t in args.tags.split(",")
+            if t.strip()
+        ]
+    if args.add_tag:
+        for t in args.add_tag:
+            tag = t.strip().lstrip("#")
+            if tag and tag not in new_tags:
+                new_tags.append(tag)
+    if args.remove_tag:
+        for t in args.remove_tag:
+            tag = t.strip().lstrip("#")
+            if tag:
+                new_tags = [x for x in new_tags if x != tag]
+
+    new_due = args.due if args.due is not None else task.due
+    if new_due == "":
+        new_due = None
+
+    new_project = args.project if args.project is not None else task.project
+    if new_project == "":
+        new_project = None
+
+    new_priority = args.priority if args.priority is not None else task.priority
+    if new_priority == "":
+        new_priority = None
+
+    new_line = build_task_line(
+        title=new_title,
+        state=task.state,
+        tags=new_tags if new_tags else None,
+        priority=new_priority,
+        due=new_due,
+        project=new_project,
+        created=task.created,
+        done_date=task.done_date,
+    )
+
+    def normalize_desc_lines(desc_lines: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for line in desc_lines:
+            if line.startswith("  "):
+                normalized.append(line)
+            else:
+                normalized.append(f"  {line}")
+        return normalized
+
+    if args.clear_description:
+        new_desc = []
+    elif args.description is not None:
+        new_desc = normalize_desc_lines(args.description)
+    elif args.add_description:
+        new_desc = existing_desc + normalize_desc_lines(args.add_description)
+    else:
+        new_desc = existing_desc
+
+    if new_line == lines[task_start] and new_desc == existing_desc:
+        print("No changes made")
+        return
+
+    new_file_lines = lines[:task_start] + [new_line] + new_desc + lines[task_end:]
+    write_file(filepath, new_file_lines)
+
+    def fmt_value(value: str | None) -> str:
+        return value if value else "(none)"
+
+    def fmt_tags(tags: list[str]) -> str:
+        return ", ".join(tags) if tags else "(none)"
+
+    def fmt_desc(desc: list[str]) -> str:
+        if not desc:
+            return "(none)"
+        count = len(desc)
+        return f"{count} line" if count == 1 else f"{count} lines"
+
+    changes: list[str] = []
+    if task.title != new_title:
+        changes.append(f"  title: {task.title} → {new_title}")
+    if task.due != new_due:
+        changes.append(f"  due: {fmt_value(task.due)} → {fmt_value(new_due)}")
+    if task.project != new_project:
+        changes.append(
+            f"  project: {fmt_value(task.project)} → {fmt_value(new_project)}"
+        )
+    if task.priority != new_priority:
+        changes.append(
+            f"  priority: {fmt_value(task.priority)} → {fmt_value(new_priority)}"
+        )
+    if (task.tags or []) != (new_tags or []):
+        changes.append(f"  tags: {fmt_tags(task.tags)} → {fmt_tags(new_tags)}")
+    if existing_desc != new_desc:
+        changes.append(
+            f"  description: {fmt_desc(existing_desc)} → {fmt_desc(new_desc)}"
+        )
+
+    print(f"✓ Edited '{new_title}'")
+    for line in changes:
+        print(line)
+
+
 def cmd_move(args: argparse.Namespace) -> None:
     """Move a task between sections (Active/Backlog/Someday)."""
     target_section = args.to.capitalize()
@@ -885,6 +1042,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override vault directory (or set ARGOS_VAULT_DIR).",
     )
 
+    # edit
+    p_edit = sub.add_parser("edit", help="Edit task properties")
+    p_edit.add_argument("title_query", metavar="title", help="Task title (fuzzy match)")
+    p_edit.add_argument("--title", dest="new_title", help="New title")
+    p_edit.add_argument("--due", help="Due date (YYYY-MM-DD, or empty to clear)")
+    p_edit.add_argument("--project", help="Project name (or empty to clear)")
+    p_edit.add_argument("--priority", help="Priority (high/medium/low, or empty to clear)")
+    p_edit.add_argument("--tags", help="Replace all tags (comma-separated)")
+    p_edit.add_argument("--add-tag", action="append", default=None, help="Add a tag (repeatable)")
+    p_edit.add_argument("--remove-tag", action="append", default=None, help="Remove a tag (repeatable)")
+    p_edit.add_argument(
+        "--description",
+        "-d",
+        action="append",
+        default=None,
+        help="Replace description (repeatable, each = one line)",
+    )
+    p_edit.add_argument(
+        "--add-description",
+        action="append",
+        default=None,
+        help="Append description line (repeatable)",
+    )
+    p_edit.add_argument(
+        "--clear-description",
+        action="store_true",
+        help="Remove all description lines",
+    )
+    p_edit.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
+    p_edit.set_defaults(func=cmd_edit, _parser=p_edit)
+
     # move
     p_move = sub.add_parser("move", help="Move task between sections")
     p_move.add_argument("title", help="Task title (fuzzy match)")
@@ -919,11 +1110,12 @@ def main() -> None:
         "list": cmd_list,
         "add": cmd_add,
         "done": cmd_done,
+        "edit": cmd_edit,
         "move": cmd_move,
         "health": cmd_health,
     }
 
-    cmd_fn = commands.get(args.command)
+    cmd_fn = getattr(args, "func", None) or commands.get(args.command)
     if cmd_fn:
         cmd_fn(args)
     else:
