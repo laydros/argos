@@ -860,6 +860,29 @@ function formatStatusTime(value) {
   return parsed.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
+function classifyMetric(value, warn, critical) {
+  if (typeof value !== 'number' || Number.isNaN(value)) return null;
+  if (value >= critical) return 'critical';
+  if (value >= warn) return 'warn';
+  return null;
+}
+
+function buildMetricDisplay(value, severity) {
+  if (!value) return { text: 'Unknown', severity: null };
+  if (severity === 'critical') return { text: `❗ ${value}`, severity };
+  if (severity === 'warn') return { text: `⚠️ ${value}`, severity };
+  return { text: value, severity: null };
+}
+
+function parseNumber(value) {
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
 async function loadStatusWidget() {
   const container = document.getElementById('status-rows');
   const updatedLabel = document.getElementById('status-updated');
@@ -889,13 +912,34 @@ async function loadStatusWidget() {
   const codexWeeklyValue = formatCodexUsage(data && data.codexWeekly);
   const openclawVersion = data && data.openclaw ? data.openclaw.version : null;
   const gatewayUptime = data && data.openclaw ? data.openclaw.gatewayUptime : null;
-  const agentUptime = data && data.agent ? data.agent.uptime : null;
+  const zag = data && data.zag ? data.zag : null;
+  const zagUptime = zag ? zag.uptime : null;
+
+  const ramPercent = zag && typeof zag.ramUsedBytes === 'number' && typeof zag.ramTotalBytes === 'number'
+    ? (zag.ramUsedBytes / Math.max(zag.ramTotalBytes, 1)) * 100
+    : null;
+  const swapPercent = zag && typeof zag.swapUsedBytes === 'number' && typeof zag.swapTotalBytes === 'number'
+    ? (zag.swapUsedBytes / Math.max(zag.swapTotalBytes, 1)) * 100
+    : null;
+  const diskPercent = zag && typeof zag.diskPercent === 'number'
+    ? zag.diskPercent
+    : null;
+  const loadAvg = parseNumber(zag && zag.loadAvg);
+
+  const ramDisplay = buildMetricDisplay(zag && zag.ram, classifyMetric(ramPercent, 80, 90));
+  const swapDisplay = buildMetricDisplay(zag && zag.swap, classifyMetric(swapPercent, 20, 50));
+  const diskDisplay = buildMetricDisplay(zag && zag.disk, classifyMetric(diskPercent, 80, 90));
+  const loadDisplay = buildMetricDisplay(zag && zag.loadAvg, classifyMetric(loadAvg, 1.0, 2.0));
 
   const rows = [
     { label: 'OpenClaw', value: openclawVersion || 'Unknown' },
     { label: 'Dashboard', value: DASHBOARD_VERSION },
     { label: 'Gateway Uptime', value: gatewayUptime || 'Unknown' },
-    { label: 'Agent Uptime', value: agentUptime || 'Unknown' },
+    { label: 'Zag Uptime', value: zagUptime || 'Unknown' },
+    { label: 'RAM', value: ramDisplay.text, severity: ramDisplay.severity },
+    { label: 'Swap', value: swapDisplay.text, severity: swapDisplay.severity },
+    { label: 'Disk', value: diskDisplay.text, severity: diskDisplay.severity },
+    { label: 'CPU Load', value: loadDisplay.text, severity: loadDisplay.severity },
     { label: 'Claude Weekly', value: claudeValue || 'Unknown' },
     { label: 'Codex', value: codexValue || 'Unknown' },
     { label: 'Codex Weekly', value: codexWeeklyValue || 'Unknown' }
@@ -904,7 +948,7 @@ async function loadStatusWidget() {
   container.innerHTML = rows.map(row => `
     <div class="status-row">
       <span class="status-label">${row.label}</span>
-      <span class="status-value">${row.value}</span>
+      <span class="status-value${row.severity ? ` ${row.severity}` : ''}">${row.value}</span>
     </div>
   `).join('');
 

@@ -8,6 +8,8 @@
   --text-muted: #a6b0c3;
   --accent: #4fd1c5;
   --accent-strong: #2cb7a8;
+  --warn: #f7b955;
+  --critical: #ff6b6b;
   --border: rgba(255, 255, 255, 0.08);
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
@@ -119,6 +121,14 @@ h2,
   font-size: 13px;
   color: var(--text);
   text-align: right;
+}
+
+.status-value.warn {
+  color: var(--warn);
+}
+
+.status-value.critical {
+  color: var(--critical);
 }
 
 .topbar {
