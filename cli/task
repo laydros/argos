@@ -437,6 +437,22 @@ def cmd_list(args: argparse.Namespace) -> None:
         section = args.section.capitalize()
         tasks = [t for t in tasks if t.section == section]
 
+    if args.tag:
+        wanted_tags = {tag.lower().lstrip("#") for tag in args.tag}
+        tasks = [
+            t
+            for t in tasks
+            if t.tags and any(tag.lower() in wanted_tags for tag in t.tags)
+        ]
+
+    if args.project:
+        target_project = args.project.lower()
+        tasks = [
+            t
+            for t in tasks
+            if t.project and t.project.lower() == target_project
+        ]
+
     if not tasks:
         print("No tasks found.")
         return
@@ -630,7 +646,15 @@ def cmd_move(args: argparse.Namespace) -> None:
         print(f"Error: No task matching '{args.title}'")
         sys.exit(1)
 
-    if task.section == target_section:
+    target_owner = None
+    if args.to_owner:
+        target_owner = args.to_owner.lower()
+        if target_owner not in TASK_FILES and target_owner != "inbox":
+            valid = ", ".join(list(TASK_FILES.keys()) + ["inbox"])
+            print(f"Error: Unknown owner '{args.to_owner}'. Valid: {valid}")
+            sys.exit(1)
+
+    if task.section == target_section and (not target_owner or target_owner == task.owner):
         print(f"Task '{task.title}' is already in {target_section}")
         return
 
@@ -661,6 +685,29 @@ def cmd_move(args: argparse.Namespace) -> None:
            and task_start < len(new_lines)
            and new_lines[task_start].strip() == ""):
         new_lines.pop(task_start)
+
+    if target_owner and target_owner != task.owner:
+        write_file(filepath, new_lines)
+
+        dest_path = INBOX_FILE if target_owner == "inbox" else TASK_FILES[target_owner]
+        dest_lines = read_file(dest_path)
+        dest_lines = ensure_section_exists(dest_lines, target_section)
+
+        insert_at = find_insert_point(dest_lines, target_section)
+        if insert_at == -1:
+            print(f"Error: Could not find section '{target_section}'")
+            sys.exit(1)
+
+        final_lines = dest_lines[:insert_at]
+        if final_lines and final_lines[-1].strip() and not final_lines[-1].startswith("##"):
+            if final_lines[-1].startswith("  "):
+                final_lines.append("")
+        final_lines.extend(removed_lines)
+        final_lines.extend(dest_lines[insert_at:])
+
+        write_file(dest_path, final_lines)
+        print(f"✓ Moved '{task.title}' from {task.owner} → {target_owner}/{target_section}")
+        return
 
     # Ensure target section exists
     new_lines = ensure_section_exists(new_lines, target_section)
@@ -807,6 +854,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_list = sub.add_parser("list", help="List tasks")
     p_list.add_argument("--owner", "-o", help="Filter by owner (work/personal/zag)")
     p_list.add_argument("--section", "-s", help="Filter by section (Active/Backlog/Someday/Done)")
+    p_list.add_argument("--tag", action="append", help="Filter by tag (repeatable)")
+    p_list.add_argument("--project", help="Filter by project")
     p_list.add_argument("--compact", "-c", action="store_true", help="Hide descriptions")
     p_list.add_argument(
         "--vault-dir",
@@ -840,6 +889,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_move = sub.add_parser("move", help="Move task between sections")
     p_move.add_argument("title", help="Task title (fuzzy match)")
     p_move.add_argument("--to", required=True, help="Target section (Active/Backlog/Someday/Done)")
+    p_move.add_argument("--to-owner", help="Target owner (work/personal/zag/inbox)")
     p_move.add_argument(
         "--vault-dir",
         help="Override vault directory (or set ARGOS_VAULT_DIR).",
