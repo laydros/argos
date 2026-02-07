@@ -529,6 +529,9 @@ def cmd_add(args: argparse.Namespace) -> None:
         if new_lines[-1].startswith("  "):
             new_lines.append("")
     new_lines.append(task_line)
+    if args.description:
+        for desc in args.description:
+            new_lines.append(f"  {desc}")
     new_lines.extend(lines[insert_at:])
 
     write_file(filepath, new_lines)
@@ -805,6 +808,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--owner", "-o", help="Filter by owner (work/personal/zag)")
     p_list.add_argument("--section", "-s", help="Filter by section (Active/Backlog/Someday/Done)")
     p_list.add_argument("--compact", "-c", action="store_true", help="Hide descriptions")
+    p_list.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
 
     # add
     p_add = sub.add_parser("add", help="Add a new task")
@@ -815,18 +822,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--project", help="Project name")
     p_add.add_argument("--priority", choices=["high", "medium", "low"], help="Priority level")
     p_add.add_argument("--tags", help="Comma-separated tags")
+    p_add.add_argument("--description", "-d", action="append", default=None, help="Description line (repeatable)")
+    p_add.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
 
     # done
     p_done = sub.add_parser("done", help="Mark a task as done")
     p_done.add_argument("title", help="Task title (fuzzy match)")
+    p_done.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
 
     # move
     p_move = sub.add_parser("move", help="Move task between sections")
     p_move.add_argument("title", help="Task title (fuzzy match)")
     p_move.add_argument("--to", required=True, help="Target section (Active/Backlog/Someday/Done)")
+    p_move.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
 
     # health
-    sub.add_parser("health", help="Check for format issues")
+    p_health = sub.add_parser("health", help="Check for format issues")
+    p_health.add_argument(
+        "--vault-dir",
+        help="Override vault directory (or set ARGOS_VAULT_DIR).",
+    )
 
     return parser
 
