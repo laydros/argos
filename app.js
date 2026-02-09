@@ -1266,12 +1266,13 @@ function getLocalDateString() {
 
 async function loadContext(token) {
   const container = document.getElementById('context-content');
+  if (!container) return;
   if (!isTabActive('home', token)) return;
   
   try {
     // Try to load recent memory file
     const today = getLocalDateString();
-    const memoryPath = `/data/memory/${today}.md`;
+    const memoryPath = `${DATA_PREFIX}/memory/${today}.md`;
     
     const resp = await fetch(cacheBust(memoryPath));
     if (!isTabActive('home', token)) return;
@@ -1296,7 +1297,7 @@ async function loadContext(token) {
       
       if (summary.length > 0) {
         container.innerHTML = `<p>${summary.join('<br>')}</p>
-          <p class="subtle"><a href="#" class="view-memory-log" data-path="/data/memory/${today}.md">View full log →</a></p>`;
+          <p class="subtle"><a href="#" class="view-memory-log" data-path="${memoryPath}">View full log →</a></p>`;
       } else {
         container.innerHTML = '<p class="subtle">No context logged today yet.</p>';
       }
@@ -1304,6 +1305,7 @@ async function loadContext(token) {
       container.innerHTML = '<p class="subtle">No memory file for today.</p>';
     }
   } catch (err) {
+    console.error('Error loading context:', err);
     container.innerHTML = '<p class="subtle">Could not load context.</p>';
   }
 }
@@ -1315,7 +1317,7 @@ async function loadBrief(token) {
   
   try {
     const today = getLocalDateString();
-    const briefPath = `/data/memory/briefs/${today}.md`;
+    const briefPath = `${DATA_PREFIX}/memory/briefs/${today}.md`;
     
     const resp = await fetch(cacheBust(briefPath));
     if (!isTabActive('home', token)) return;
