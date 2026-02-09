@@ -1232,13 +1232,8 @@ async function loadHome(token) {
   document.getElementById('stat-backlog').textContent = counts.backlog;
   document.getElementById('stat-inbox').textContent = counts.inbox;
   
-  // Render active tasks on home page
-  const allActive = [
-    ...taskData.work.active.map(t => ({ ...t, owner: 'work' })),
-    ...taskData.personal.active.map(t => ({ ...t, owner: 'personal' })),
-    ...taskData.agent.active.map(t => ({ ...t, owner: 'agent' }))
-  ];
-  renderList(allActive, 'home-active-list', 'home-active-count', { showOwner: true, enableDetails: true, skipGroupHeaders: true });
+  // Render active tasks on home page from Todoist data
+  loadHomeActiveTodoist(token);
   
   // Load today's brief
   loadBrief(token);
@@ -1254,6 +1249,62 @@ async function loadHome(token) {
   
   // Load weather
   loadWeather(token);
+}
+
+function formatUpdatedTime(value) {
+  if (!value) return '';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return parsed.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+async function loadHomeActiveTodoist(token) {
+  const list = document.getElementById('home-active-list');
+  const count = document.getElementById('home-active-count');
+  const updated = document.getElementById('home-active-updated');
+  if (!list || !count) return;
+  if (!isTabActive('home', token)) return;
+
+  if (updated) updated.textContent = '';
+
+  try {
+    const path = `${DATA_PREFIX}/todoist-active.json`;
+    const resp = await fetch(cacheBust(path));
+    if (!isTabActive('home', token)) return;
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+    const data = await resp.json();
+    if (!isTabActive('home', token)) return;
+
+    const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+    count.textContent = tasks.length;
+
+    if (tasks.length === 0) {
+      list.innerHTML = '<li class="subtle">No active tasks</li>';
+    } else {
+      list.innerHTML = tasks.map(task => {
+        const isP1 = task.priority === 'p1';
+        const title = task.title || 'Untitled task';
+        const project = task.project ? `<span class="task-project-badge todoist-project-badge">${task.project}</span>` : '';
+        const priority = isP1 ? '<span class="priority-indicator" aria-hidden="true">🔥</span>' : '';
+        return `
+          <li class="task-row todoist-task${isP1 ? ' is-p1' : ''}">
+            ${priority}<span class="title">${title}</span>${project}
+          </li>
+        `;
+      }).join('');
+    }
+
+    if (updated) {
+      const time = formatUpdatedTime(data.updated);
+      updated.textContent = time ? `Updated ${time}` : '';
+    }
+  } catch (err) {
+    console.error('Error loading Todoist active tasks:', err);
+    count.textContent = '0';
+    list.innerHTML = '<li class="subtle">No active tasks data</li>';
+    if (updated) updated.textContent = '';
+  }
 }
 
 function getLocalDateString() {
